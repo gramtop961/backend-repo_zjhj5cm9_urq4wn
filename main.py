@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from bson import ObjectId
@@ -99,6 +99,11 @@ def ensure_seed_data():
 @app.on_event("startup")
 def startup_event():
     ensure_seed_data()
+    # Enforce uniqueness: one vote per voter per idea
+    try:
+        db["vote"].create_index([("idea_id", 1), ("voter", 1)], unique=True)
+    except Exception:
+        pass
 
 @app.get("/")
 def root():
@@ -164,7 +169,13 @@ def get_idea(idea_id: str):
 
 @app.post("/api/ideas")
 def create_idea(payload: IdeaCreate):
-    new_id = create_document("idea", payload)
+    data = payload.model_dump()
+    # Normalize link if provided (prepend https:// if missing scheme)
+    link = data.get("link")
+    if link:
+        if not (link.startswith("http://") or link.startswith("https://")):
+            data["link"] = f"https://{link}"
+    new_id = create_document("idea", data)
     doc = db["idea"].find_one({"_id": ObjectId(new_id)})
     return serialize_doc(doc)
 
@@ -178,11 +189,20 @@ def add_comment(payload: CommentCreate):
     return serialize_doc(doc)
 
 @app.post("/api/votes")
-def add_vote(payload: VoteCreate):
+def add_vote(payload: VoteCreate, request: Request):
     # Validate idea exists
     if not db["idea"].find_one({"_id": ObjectId(payload.idea_id)}):
         raise HTTPException(status_code=404, detail="Idea not found")
-    _id = create_document("vote", payload)
+    # Determine voter identity (prefer provided voter, fall back to client IP)
+    voter_identity = payload.voter or (request.client.host if request.client else None)
+    if not voter_identity:
+        # If no voter identity can be determined, reject to prevent duplicate votes
+        raise HTTPException(status_code=400, detail="Missing voter identity")
+    # Enforce one vote per voter per idea
+    existing = db["vote"].find_one({"idea_id": payload.idea_id, "voter": voter_identity})
+    if existing:
+        raise HTTPException(status_code=409, detail="Already voted")
+    _id = create_document("vote", {"idea_id": payload.idea_id, "voter": voter_identity})
     doc = db["vote"].find_one({"_id": ObjectId(_id)})
     return serialize_doc(doc)
 
